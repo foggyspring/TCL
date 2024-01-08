@@ -10,7 +10,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf, ListConfig
 from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
 from pytorch_lightning.utilities import rank_zero_only
-from pytorch_lightning.loggers import LightningLoggerBase
+from pytorch_lightning.loggers import Logger
 from pytorch_lightning.callbacks import LearningRateMonitor
 from spil.utils.utils import (
     get_git_commit_hash,
@@ -58,10 +58,10 @@ def train(cfg: DictConfig) -> None:
     }
 
     # Configure multi-GPU training
-    if is_multi_gpu_training(trainer_args["gpus"]):  # type: ignore
-        trainer_args["strategy"] = "ddp"
-        if not cfg.slurm:
-            modify_argv_hydra()
+    # if is_multi_gpu_training(trainer_args["gpus"]):  # type: ignore
+    #     trainer_args["strategy"] = "ddp"
+        # if not cfg.slurm:
+        #     modify_argv_hydra()
 
     trainer = Trainer(**trainer_args)
     trainer.fit(model, datamodule=datamodule, ckpt_path=chk)
@@ -117,7 +117,7 @@ def modify_argv_hydra() -> None:
         sys.argv.append(o)  # type: ignore
 
 
-def setup_logger(cfg: DictConfig, model: LightningModule) -> LightningLoggerBase:
+def setup_logger(cfg: DictConfig, model: LightningModule) -> Logger:
     """
     Set up the logger (tensorboard or wandb) from hydra config.
 

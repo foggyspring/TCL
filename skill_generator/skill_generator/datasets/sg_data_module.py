@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from typing import Dict, List
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.trainer.supporters import CombinedLoader
+from pytorch_lightning.utilities import CombinedLoader
 from pathlib import Path
 import numpy as np
 from typing import Dict, Optional

@@ -9,7 +9,7 @@ import git
 import hydra
 import numpy as np
 import pytorch_lightning
-from pytorch_lightning.utilities.cloud_io import load as pl_load
+from lightning_fabric.utilities.cloud_io import _load as pl_load
 import torch
 import tqdm
 

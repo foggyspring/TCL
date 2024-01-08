@@ -59,7 +59,7 @@ class TSNEPlot(Callback):
             outputs: Optional[STEP_OUTPUT],
             batch: Any,
             batch_idx: int,
-            dataloader_idx: int,
+            # dataloader_idx: int,
     ) -> None:
         self.sampled_latent_skills.append(outputs["latent_skills"])
         self.sampled_skill_types.append(outputs["skill_types"])
