@@ -28,3 +28,8 @@ mia_auxiliary_loss_beta: ${loss.mia_auxiliary_loss_beta}
 replan_freq: 30
 use_clip_auxiliary_loss: true
 clip_auxiliary_loss_beta: ${loss.clip_auxiliary_loss_beta}
+
+# contrastive learning parameters
+#use_temporal_contrastive_loss: true
+#temporal_contrastive_loss_beta: ${loss.temporal_contrastive_loss_beta}
+#temperature: 1.1

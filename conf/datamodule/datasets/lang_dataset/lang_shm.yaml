@@ -1,4 +1,5 @@
 _target_: spil.datasets.shm_dataset.ShmDataset
+# _target_: spil.datasets.spil_data_module.SpilDataModule
 key: "lang"
 batch_size: 32
 min_window_size: 20

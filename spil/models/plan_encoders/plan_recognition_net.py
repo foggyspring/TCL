@@ -47,7 +47,7 @@ class PlanRecognitionTransformersNetwork(nn.Module):
         self,
         num_heads: int,
         num_layers: int,
-        encoder_hidden_size: int,
+        encoder_hidden_size: int, # 2048
         fc_hidden_size: int,
         plan_features: int,
         in_features: int,
@@ -67,9 +67,9 @@ class PlanRecognitionTransformersNetwork(nn.Module):
         self.padding = False
         self.dist = dist
         self.hidden_size = fc_hidden_size
-        self.position_embedding = position_embedding
-        self.encoder_normalize = encoder_normalize
-        self.positional_normalize = positional_normalize
+        self.position_embedding = position_embedding # true
+        self.encoder_normalize = encoder_normalize # false
+        self.positional_normalize = positional_normalize # false
         mod = self.in_features % num_heads
         if mod != 0:
             print(f"Padding for Num of Heads : {num_heads}")
@@ -77,7 +77,7 @@ class PlanRecognitionTransformersNetwork(nn.Module):
             self.pad = num_heads - mod
             self.in_features += self.pad
         if position_embedding:
-            self.position_embeddings = nn.Embedding(max_position_embeddings, self.in_features)
+            self.position_embeddings = nn.Embedding(max_position_embeddings, self.in_features) # max_position_embeddings 32
         else:
             self.positional_encoder = PositionalEncoding(self.in_features)  # TODO: with max window_size
         encoder_layer = nn.TransformerEncoderLayer(
@@ -107,10 +107,12 @@ class PlanRecognitionTransformersNetwork(nn.Module):
             x = self.positional_encoder(perceptual_emb.permute(1, 0, 2))  # [s, b, emb]
         if self.positional_normalize:
             x = self.layernorm(x)
+            
         x = self.dropout(x)
-        x = self.transformer_encoder(x)
-        x = self.fc(x.permute(1, 0, 2))
-        x = torch.mean(x, dim=1)  # gather all the sequence info
+        x = self.transformer_encoder(x) # the first dimension is the sequence length, required by the transformer
+        x = self.fc(x.permute(1, 0, 2)) # [b, s, emb]
+        
+        x = torch.mean(x, dim=1)  # gather all the sequence info, [b, emb] global average pooling
         x = torch.nan_to_num(x, posinf=torch.finfo(torch.float16).max, neginf=torch.finfo(torch.float16).min)
         my_state = self.fc_state(x)
         state = self.dist.forward_dist(my_state)

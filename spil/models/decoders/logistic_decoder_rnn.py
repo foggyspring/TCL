@@ -48,13 +48,13 @@ class LogisticDecoderRNN(ActionDecoder):
         perceptual_emb_slice: Optional[tuple] = None,
     ):
         super(LogisticDecoderRNN, self).__init__()
-        self.n_dist = n_mixtures
+        self.n_dist = n_mixtures # 10
         self.gripper_control = gripper_control
         self.discrete_gripper = discrete_gripper
         self.log_scale_min = log_scale_min
-        self.num_classes = num_classes
+        self.num_classes = num_classes # 10
         self.plan_features = plan_features
-        if perceptual_emb_slice is not None:
+        if perceptual_emb_slice is not None: # [64, 128]
             in_features = (perceptual_emb_slice[1] - perceptual_emb_slice[0]) + latent_goal_features + plan_features
         else:
             in_features = perceptual_features + latent_goal_features + plan_features

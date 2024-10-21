@@ -8,3 +8,5 @@ visual_features: 64
 num_c: 3
 use_sinusoid: false
 spatial_softmax_temp: 1.0
+num_seg: 15 # divide the video images into num_seg segments
+seg_size: 4 # number of frames in each segment 

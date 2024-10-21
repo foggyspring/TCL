@@ -101,7 +101,7 @@ class Hulc(pl.LightningModule):
         self.visual_goal = hydra.utils.instantiate(visual_goal)
         self.language_goal = hydra.utils.instantiate(language_goal) if language_goal else None
 
-        # language encoder
+        # language encoder, spil.models.encoders.lang_encoder.LanguageEncoder
         self.language_encoder = hydra.utils.instantiate(language_encoder) if language_encoder else None
 
         # policy network
@@ -122,7 +122,7 @@ class Hulc(pl.LightningModule):
         if mia_lang_discriminator:
             self.mia_lang_discriminator = hydra.utils.instantiate(mia_lang_discriminator)
             self.proj_vis_lang = hydra.utils.instantiate(proj_vis_lang)
-        self.state_recons = state_recons
+        self.state_recons = state_recons # false
         self.st_recon_beta = state_recon_beta
 
         self.kl_beta = kl_beta
@@ -281,12 +281,12 @@ class Hulc(pl.LightningModule):
             seq_feat: Features of plan recognition network before distribution.
         """
         # ------------Plan Proposal------------ #
-        pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal)
+        pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal) # initial state, and latent vis/lang goal
         pp_dist = self.dist.get_dist(pp_state)
 
         # ------------Plan Recognition------------ #
-        pr_state, seq_feat = self.plan_recognition(perceptual_emb)
-        pr_dist = self.dist.get_dist(pr_state)
+        pr_state, seq_feat = self.plan_recognition(perceptual_emb) # seq_feat is the global feature of the sequence
+        pr_dist = self.dist.get_dist(pr_state) # one-hot distribution
 
         sampled_plan = pr_dist.rsample()  # sample from recognition net
         if self.dist.dist == "discrete":
@@ -432,10 +432,18 @@ class Hulc(pl.LightningModule):
         encoders_dict = {}
         batch_size: Dict[str, int] = {}
         total_bs = 0
+        # TODO: add temporal contrastive loss for visual encoder. Meanwhile, the language latent goal can be a label to identify the task
+        # The demonstrations can be grouped together that have similar visual representation or the same language latent goal to represent the task.
+        # The temporal contrastive consist of the part, one is instance contrastive loss, the other is group contrastive loss. 
+        # Inspired by "Semi-Supervised Action Recognition with Temporal Contrastive Learning" by Ankit Singh et al.
+        
         for self.modality_scope, dataset_batch in batch.items():
+            #train only with lang goal test
+            if "lang" not in self.modality_scope:
+                continue
             perceptual_emb = self.perceptual_encoder(
                 dataset_batch["rgb_obs"], dataset_batch["depth_obs"], dataset_batch["robot_obs"]
-            )
+            ) # (batch, seq, 64), if static depth or gripper cam is not None, then (batch, seq, 128)
             if self.state_recons:
                 proprio_loss += self.perceptual_encoder.state_reconstruction_loss()
             if "lang" in self.modality_scope:
@@ -649,6 +657,8 @@ class Hulc(pl.LightningModule):
 
         Returns:
             Contrastive loss.
+            
+        Contrastive loss between visual and language embeddings from CLIP.
         """
         assert self.use_clip_auxiliary_loss is not None
         if use_for_aux_loss is not None:

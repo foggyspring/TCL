@@ -1,7 +1,9 @@
 import logging
 from pathlib import Path
 from .action_decoder import ActionDecoder
+import numpy as np
 import skill_generator.models.skill_generator as model_sg
+# import skill_generator.skill_generator.models.skill_generator as model_sg
 from typing import Optional, Tuple
 import spil
 import hydra
@@ -31,7 +33,7 @@ class SkillDecoder(ActionDecoder):
             criterion: str,
             num_layers: int,
             rnn_model: str,
-            perceptual_emb_slice: list,
+            perceptual_emb_slice: list, 
             gripper_control: bool,
             sg_chk_path: str,
             skill_len: int,
@@ -48,20 +50,28 @@ class SkillDecoder(ActionDecoder):
         self.rnn = eval(rnn_model)
         self.rnn = self.rnn(in_features, hidden_size, num_layers, policy_rnn_dropout_p)
         self.skills = nn.Linear(hidden_size, out_features)
-
+        self.skill_len = skill_len
         self.skill_selector = eval(rnn_model)
         self.skill_selector = self.skill_selector((perceptual_emb_slice[1] - perceptual_emb_slice[0]) + lang_in_features, hidden_size2, num_layers, policy_rnn_dropout_p)
         self.skill_classes = nn.Sequential(
             nn.Linear(hidden_size2, skill_num),
             nn.Softmax(dim=-1)
         )
+        
+        self.action_dim = 7 #  delta XYZ position, delta euler angles and the gripper action.
+        self.max_plan_timesteps = 30 # the maximum timesteps of each plan
+        self.plan_actions = torch.zeros([self.max_plan_timesteps, self.max_plan_timesteps+self.skill_len, self.action_dim]).cuda() 
 
         self.criterion = getattr(nn, criterion)()
-        self.perceptual_emb_slice = perceptual_emb_slice
-        self.time_slice = [0, None, skill_len]
-        self.skill_num = skill_num
+        self.perceptual_emb_slice = perceptual_emb_slice # [0, 128]
+        self.time_slice = [0, None, skill_len] # [0, None, 5]
+        self.skill_num = skill_num # 3
         self.hidden_state = {'skill_emb': None, 'skill_cls': None}
+        self.hidden_state2 = list()
+        for i in range(skill_len):
+            self.hidden_state2.append({'skill_emb': None, 'skill_cls': None})
         self.sg_chk_path = Path(sg_chk_path)
+        logger.info(f'load from skill generator checkpoint {self.sg_chk_path}')
         if not self.sg_chk_path.is_absolute():
             self.sg_chk_path = Path(spil.__file__).parents[1] / self.sg_chk_path
 
@@ -117,6 +127,16 @@ class SkillDecoder(ActionDecoder):
 
     def clear_hidden_state(self) -> None:
         self.hidden_state = {'skill_emb': None, 'skill_cls': None}
+        
+        self.hidden_state2 = list()
+        for i in range(self.skill_len):
+            self.hidden_state2.append({'skill_emb': None, 'skill_cls': None})
+
+    def clear_cached_actions(self) -> None:
+        self.cached_actions = deque([])
+        self.cached_actions2 = list()
+        for i in range(self.skill_len):
+            self.cached_actions2.append(deque([]))
 
     def forward(
             self,
@@ -130,7 +150,7 @@ class SkillDecoder(ActionDecoder):
         """
         Args:
             latent_plan: plan_embedding in the latent space with the shape of (B, N_z)
-            perceptual_emb: perceptual_embedding with the shape of (B, T, N_p)
+            perceptual_emb: perceptual_embedding with the shape of (B, T, N_p), T: time sequence
             latent_goal: goal_embedding with the shape of (B, N_g)
             lang_emb: the embedding contains the language information. It is used to reconstruct sequences of skill types that are the prior knowledge for skill sampling.
             hs_0: the initial hidden states for skill embedding sequences
@@ -143,7 +163,7 @@ class SkillDecoder(ActionDecoder):
             hc_n: the output hidden states for skill class sequences
             act_seq_len: the required action sequence length
         """
-        act_seq_len = perceptual_emb.shape[1]
+        act_seq_len = perceptual_emb.shape[1] # sequence length of the action, T steps
         perceptual_emb = perceptual_emb[..., slice(*self.time_slice), slice(*self.perceptual_emb_slice)]
         batch_size, skill_seq_len = perceptual_emb.shape[0], perceptual_emb.shape[1]
         latent_plan = latent_plan.unsqueeze(1).expand(-1, skill_seq_len, -1)
@@ -224,6 +244,10 @@ class SkillDecoder(ActionDecoder):
             lang_emb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
+        The cached_actions are used to store the predicted action sequence (5 actions) generated from the skill decoder. 
+        Each step return the first action in the cached actions and remove it from the deque, until the deque is empty.
+        The the skill decoder will be called to generate the next action sequence based on the current state.
+        
         Args:
             latent_plan: the plan embedding in the latent space with the shape of (B, N_z)
             perceptual_emb: the perceptual embedding with the shape of (B, T, N_p)
@@ -234,7 +258,7 @@ class SkillDecoder(ActionDecoder):
         Returns:
             pred_actions: the predicted actions with the shape of (B, T_a, N_a)
         """
-        if not self.cached_actions:
+        if not self.cached_actions: # cached_actions is a deque
             skill_emb, self.hidden_state['skill_emb'], skill_cls, self.hidden_state['skill_cls'], act_seq_len = self(
                 latent_plan, perceptual_emb, latent_goal,
                 hs_0=self.hidden_state['skill_emb'], hc_0=self.hidden_state['skill_cls'])
@@ -249,11 +273,122 @@ class SkillDecoder(ActionDecoder):
 
         return self.cached_actions.popleft()
 
+    def act_chunk_with_queue(
+            self,
+            latent_plan: torch.Tensor,
+            perceptual_emb: torch.Tensor,
+            latent_goal: torch.Tensor,
+            robot_obs: Optional[torch.Tensor] = None,
+            lang_emb: Optional[torch.Tensor] = None,
+            rollout_step: Optional[int] = 0,
+    ) -> torch.Tensor:
+        """
+        The cached_actions are used to store the predicted action sequence (5 actions) generated from the skill decoder. 
+        Each step return the first action in the cached actions and remove it from the deque, until the deque is empty.
+        The the skill decoder will be called to generate the next action sequence based on the current state.
+        
+        Args:
+            latent_plan: the plan embedding in the latent space with the shape of (B, N_z)
+            perceptual_emb: the perceptual embedding with the shape of (B, T, N_p)
+            latent_goal: the goal embedding with the shape of (B, N_g)
+            robot_obs: the current observation of the robot which is used for gripper frame and world frame transformation
+            lang_emb: the embeddings contains language information with the shape of (B, N_l)
+
+        Returns:
+            pred_actions: the predicted actions with the shape of (B, T_a, N_a)
+        """
+        p = rollout_step % self.skill_len
+        skill_emb, self.hidden_state2[p]['skill_emb'], skill_cls, self.hidden_state2[p]['skill_cls'], act_seq_len = self(
+            latent_plan, perceptual_emb, latent_goal,
+            hs_0=self.hidden_state2[p]['skill_emb'], hc_0=self.hidden_state2[p]['skill_cls'])
+        pred_actions = self._action_generation(skill_emb)
+        if self.gripper_control:
+            pred_actions = tcp_to_world_frame(pred_actions, robot_obs) # (B, T_a, N_a) = [1, 5, 7]  
+        
+        time = rollout_step % self.max_plan_timesteps
+        if time == 0:
+            self.plan_actions = torch.zeros([self.max_plan_timesteps, self.max_plan_timesteps+self.skill_len, self.action_dim]).cuda()
+        
+        for i in range(pred_actions.shape[1]):
+            self.plan_actions[time, time+i:time+i+1, :] = pred_actions[:, i:i+1, :]
+        
+        index = (time // self.skill_len) * self.skill_len
+        curr_step_action = self.plan_actions[index:time+1,time]
+        # k = 1 ## average len = 1.314, 1.24
+        # k = 0.9 ## average 
+        # k = 1.1 # len = 1.27
+        k = 0.01
+        weights = np.exp(-k * np.arange(len(curr_step_action)))
+        # weights = np.ones(len(curr_step_action))
+        weights = weights / np.sum(weights)
+        weights = torch.from_numpy(weights).float().cuda().unsqueeze(dim=1)
+        action = (curr_step_action * weights).sum(dim=0, keepdim=True)
+        
+        return action
+
+    # Predict the action a_t based on the current state s_t, a_t = sum(w_i * S_i(t-i)), i = 1, 2, ..., t
+    # S_i(t) is the action in the i-th action sequence at the current time t, w_i is the weight of the action
+    # i_1,        S_1: (a_11, a_12, a_13, a_14, a_15),             S_1(3-1) = S_1(2) = a_13
+    # i_2,        S_2: _____ (a_21, a_22, a_23, a_24, a_25),       S_2(3-2) = S_2(1) = a_22
+    # i_3,        S_3: ____________(a_31, a_32, a_33, a_34, a_35), S_3(t-i) = S_3(3-3) = a_31
+    # a_3 = w_1 * a_13 + w_2 * a_22 + w_3 * a_31
+    # Temporal ensembling idea from Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware
+    # Need test
+    def act_t(
+            self,
+            latent_plan: torch.Tensor,
+            perceptual_emb: torch.Tensor,
+            latent_goal: torch.Tensor,
+            robot_obs: Optional[torch.Tensor] = None,
+            lang_emb: Optional[torch.Tensor] = None,
+            rollout_step: Optional[int] = 0,
+    ) -> torch.Tensor:
+        """
+        The cached_actions are used to store the predicted action sequence (5 actions) generated from the skill decoder. 
+        Return the first action in the cached_actions at each step and remove it from the deque, until the deque is empty.
+        If the cached_actions is empty, the next action sequence will be stored in the deque based on the current state.
+        
+        Args:
+            latent_plan: the plan embedding in the latent space with the shape of (B, N_z)
+            perceptual_emb: the perceptual embedding with the shape of (B, T, N_p)
+            latent_goal: the goal embedding with the shape of (B, N_g)
+            robot_obs: the current observation of the robot which is used for gripper frame and world frame transformation
+            lang_emb: the embeddings contains language information with the shape of (B, N_l)
+
+        Returns:
+            pred_actions: the predicted actions with the shape of (B, T_a, N_a), N_a = 7
+            return one action at the current time step
+        """
+        skill_emb, self.hidden_state['skill_emb'], skill_cls, self.hidden_state['skill_cls'], act_seq_len = self(
+                latent_plan, perceptual_emb, latent_goal,
+                hs_0=self.hidden_state['skill_emb'], hc_0=self.hidden_state['skill_cls'])
+        pred_actions = self._action_generation(skill_emb)
+        if self.gripper_control:
+            pred_actions = tcp_to_world_frame(pred_actions, robot_obs)
+        
+        time = rollout_step % self.max_plan_timesteps
+        if time == 0:
+            self.plan_actions = torch.zeros([self.max_plan_timesteps, self.max_plan_timesteps+self.skill_len, self.action_dim]).cuda()
+        
+        for i in range(pred_actions.shape[1]):
+            self.plan_actions[time, time+i:time+i+1, :] = pred_actions[:, i:i+1, :]
+        
+        curr_step_action = self.plan_actions[:,time,:]
+        select_action = torch.all(curr_step_action != 0, axis=1)
+        curr_step_action = curr_step_action[select_action]
+        k = 0.01
+        weights = np.exp(-k * np.arange(len(select_action)))
+        weights = weights / np.sum(weights)
+        weights = torch.from_numpy(weights).float().cuda().unsqueeze(dim=1)
+        action = (curr_step_action * weights).sum(dim=0, keepdim=True)
+        
+        return action
 
     @staticmethod
     def _hinge_loss(pred_gripper_actions, gt_gripper_actions, eps=1e-6):
         return torch.clamp(1.0 - pred_gripper_actions * gt_gripper_actions, min=eps).mean() - eps
 
+    # calculate the loss of the predicted actions and the ground truth actions, including the hinge loss for gripper control
     def _loss(self, pred_actions, gt_actions):
         loss = self.criterion(pred_actions[..., :6], gt_actions[..., :6])
         hinge_loss = self._hinge_loss(pred_actions[..., 6], gt_actions[..., 6])
@@ -299,7 +434,7 @@ class SkillDecoder(ActionDecoder):
         # loss
         if self.gripper_control:
             actions_tcp = world_to_tcp_frame(actions, robot_obs)
-            loss = self._loss(pred_actions, actions_tcp)
+            loss = self._loss(pred_actions, actions_tcp) 
             pred_actions_world = tcp_to_world_frame(pred_actions, robot_obs)
             return loss + self.gamma_1 * base_skill_reg_loss + self.gamma_2 * categorical_reg_loss, pred_actions_world
         else:
@@ -330,7 +465,7 @@ class SkillDecoder(ActionDecoder):
             categorical_reg_loss = 0.
         if self.gripper_control:
             actions_tcp = world_to_tcp_frame(actions, robot_obs)
-            loss = self._loss(pred_actions, actions_tcp)
+            loss = self._loss(pred_actions, actions_tcp) 
             return loss + self.gamma_1 * base_skill_reg_loss + self.gamma_2 * categorical_reg_loss
         else:
             loss = self._loss(pred_actions, actions)

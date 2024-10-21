@@ -14,7 +14,7 @@ import torchvision
 import spil
 from spil.datasets.utils.episode_utils import load_dataset_statistics
 from spil.datasets.utils.shared_memory_utils import load_shm_lookup, save_shm_lookup, SharedMemoryLoader
-
+import pdb
 logger = logging.getLogger(__name__)
 DEFAULT_TRANSFORM = OmegaConf.create({"train": None, "val": None})
 ONE_EP_DATASET_URL = "http://www.informatik.uni-freiburg.de/~meeso/50steps.tar.xz"
@@ -105,6 +105,8 @@ class SpilDataModule(pl.LightningDataModule):
             self.train_datasets[key] = train_dataset
             self.val_datasets[key] = val_dataset
             self.modalities.append(key)
+            
+
 
     def train_dataloader(self):
         return {

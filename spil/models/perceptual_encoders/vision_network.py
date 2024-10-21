@@ -21,6 +21,8 @@ class VisionNetwork(nn.Module):
         num_c: int,
         use_sinusoid: bool,
         spatial_softmax_temp: float,
+        num_seg: int,
+        seg_size: int,
     ):
         super(VisionNetwork, self).__init__()
         self.l2_normalize_output = l2_normalize_output
@@ -30,6 +32,8 @@ class VisionNetwork(nn.Module):
         w, h = self.calc_out_size(w, h, 4, 0, 2)
         w, h = self.calc_out_size(w, h, 3, 0, 1)
         self.use_sinusoid = use_sinusoid
+        self.num_seg = num_seg
+        self.seg_size = seg_size
         temp = None if not isinstance(spatial_softmax_temp, float) else spatial_softmax_temp
         self.spatial_softmax = SpatialSoftmax(num_rows=w, num_cols=h, temperature=temp)  # shape: [N, 128]
         # model

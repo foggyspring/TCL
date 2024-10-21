@@ -5,7 +5,7 @@ import torch.nn as nn
 
 
 class ProjVisLang(nn.Module):
-    def __init__(self, im_dim: int, lang_dim: int, output_dim: int, proj_lang: bool = True):
+    def __init__(self, im_dim: int, lang_dim: int, output_dim: int, proj_lang: bool = True): # output_dim = 32
         super().__init__()
         self.mlp_im = nn.Sequential(
             nn.Linear(in_features=im_dim, out_features=128),

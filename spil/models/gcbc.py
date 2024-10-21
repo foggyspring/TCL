@@ -3,7 +3,7 @@ from typing import Dict
 
 import torch
 
-from spil.models.hulc import Hulc
+from spil.spil.models.hulc_bk import Hulc
 
 logger = logging.getLogger(__name__)
 

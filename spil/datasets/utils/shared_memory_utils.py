@@ -101,8 +101,10 @@ class SharedMemoryLoader:
         self.dataset_type = "train" if "training" in dataset_dir.as_posix() else "val"
         self.lang_folder = datasets_cfg.lang_dataset.lang_folder
         self.naming_pattern, self.n_digits = lookup_naming_pattern(self.dataset_dir, "npz")
-        self.min_window_size_vision = datasets_cfg.vision_dataset.min_window_size
-        self.min_window_size_lang = datasets_cfg.lang_dataset.min_window_size
+        if 'vision_dataset' in datasets_cfg:
+            self.min_window_size_vision = datasets_cfg.vision_dataset.min_window_size
+        if 'lang_dataset' in datasets_cfg:
+            self.min_window_size_lang = datasets_cfg.lang_dataset.min_window_size
         self.n_proc = 16
 
     def _worker_process(self, proc_num, ep_start_end_ids, offsets, shmem, lang_ep_start_end_ids, return_dict, lock):
@@ -330,7 +332,13 @@ class SignalCallback(Callback):
     """
 
     def on_fit_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        if isinstance(trainer.datamodule.train_dataloader()["vis"].dataset, ShmDataset):  # type: ignore
-            shm_keys = trainer.datamodule.train_dataloader()["vis"].dataset.episode_lookup_dict.keys()  # type: ignore
-            signal.signal(signal.SIGTERM, partial(delete_shm, shm_keys))
-            print("Registered shared memory signal handler.")
+        if 'vis' in trainer.datamodule.train_dataloader():
+            if isinstance(trainer.datamodule.train_dataloader()["vis"].dataset, ShmDataset):  # type: ignore
+                shm_keys = trainer.datamodule.train_dataloader()["vis"].dataset.episode_lookup_dict.keys()  # type: ignore
+                signal.signal(signal.SIGTERM, partial(delete_shm, shm_keys))
+                print("Registered shared memory signal handler.")
+        elif 'lang' in trainer.datamodule.train_dataloader():
+            if isinstance(trainer.datamodule.train_dataloader()["lang"].dataset, ShmDataset):  # type: ignore
+                shm_keys = trainer.datamodule.train_dataloader()["lang"].dataset.episode_lookup_dict.keys()  # type: ignore
+                signal.signal(signal.SIGTERM, partial(delete_shm, shm_keys))
+                print("Registered shared memory signal handler.")

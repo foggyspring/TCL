@@ -29,8 +29,8 @@ class SkillGenerator(pl.LightningModule):
             prior_locator_weight: Tuple
     ):
         super().__init__()
-        self.encoder = hydra.utils.instantiate(action_encoder)
-        self.decoder = hydra.utils.instantiate(action_decoder)
+        self.encoder = hydra.utils.instantiate(action_encoder) # skill_generator.models.encoders.naive_action_encoder.NaiveActionEncoder
+        self.decoder = hydra.utils.instantiate(action_decoder) # skill_generator.models.decoders.deterministic_decoder.DeterministicDecoder
         self.prior_locator = hydra.utils.instantiate(prior_locator)
         self.optimizer_config = optimizer
         self.lr_scheduler = lr_scheduler
@@ -40,8 +40,8 @@ class SkillGenerator(pl.LightningModule):
         self.balance = prior_seeking_balance
         self.skill_dim = skill_dim
         self.dist = Distribution(dist='continuous')
-        self.scale = magic_scale
-        self.pl_w = prior_locator_weight
+        self.scale = magic_scale # [1.4, 3.0, 0.75]
+        self.pl_w = prior_locator_weight # [0.16, 0.48, 0.36]
         self.save_hyperparameters()
 
     def forward(self, acts, seq_l):
@@ -95,7 +95,7 @@ class SkillGenerator(pl.LightningModule):
 
         kl_loss_0 = D.kl_divergence(post_dist, prior_dist_detached)
         kl_loss_1 = D.kl_divergence(post_dist_detached, prior_dist)
-        return balance * kl_loss_0 + (1-balance) * kl_loss_1
+        return balance * kl_loss_0 + (1-balance) * kl_loss_1 # the balancing trick
 
     def skill_classifier(self, actions, eps=0.05):
         gripper_energy = 0.
@@ -138,7 +138,7 @@ class SkillGenerator(pl.LightningModule):
         rec_loss = ret['rec_loss']
         reg_loss = self.compute_kl_loss(skill_state, self.std_normal(B)).mean()
 
-        sc_ret = self.skill_classifier(tcp_actions)
+        sc_ret = self.skill_classifier(tcp_actions) # subskill component extraction from action sequence (tcp_actions)
         ohk, _ = sc_ret['one_hot_key'], sc_ret['skill_types']
         prior_train_loss = (self.pl_w[0] * ohk[:, 0] * self.compute_kl_loss(skill_state, translation_prior_state,
                                                                             balance=self.balance) +

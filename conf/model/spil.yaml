@@ -1,11 +1,13 @@
 defaults:
-  - perceptual_encoder: gripper_cam
+  - perceptual_encoder: gripper_cam_seg
+  # - perceptual_encoder: gripper_cam
   - plan_proposal: default
-  - plan_recognition: transformers
+  - plan_recognition: transformers_seg
   - distribution:  discrete
   - visual_goal: default
   - language_goal: default
   - language_encoder: default
+  - language_encoder2: default
   - action_decoder: skill
   - optimizer: adam
   - lr_scheduler: constant
@@ -28,3 +30,10 @@ mia_auxiliary_loss_beta: ${loss.mia_auxiliary_loss_beta}
 replan_freq: 30
 use_clip_auxiliary_loss: true
 clip_auxiliary_loss_beta: ${loss.clip_auxiliary_loss_beta}
+
+use_temporal_contrastive_loss: true
+use_action_chunk: true
+temporal_contrastive_loss_beta: ${loss.temporal_contrastive_loss_beta}
+use_lang_vis_temporal_contrastive_loss: true
+lang_vis_temporal_contrastive_loss_beta: ${loss.lang_vis_temporal_contrastive_loss_beta}
+temperature: 1.1

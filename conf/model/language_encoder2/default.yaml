@@ -1,0 +1,6 @@
+_target_: spil.models.encoders.lang_encoder2.LanguageEncoder2
+language_features: 384
+hidden_size: 2048
+out_features: 34
+word_dropout_p: 0.0
+activation_function: ReLU #ELU

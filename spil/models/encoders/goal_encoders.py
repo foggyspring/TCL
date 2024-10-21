@@ -39,9 +39,9 @@ class VisualGoalEncoder(nn.Module):
 class LanguageGoalEncoder(nn.Module):
     def __init__(
         self,
-        in_features: int,
-        hidden_size: int,
-        latent_goal_features: int,
+        in_features: int, # 384
+        hidden_size: int, # 2048
+        latent_goal_features: int, # 32
         l2_normalize_goal_embeddings: bool,
         word_dropout_p: float,
         activation_function: str,

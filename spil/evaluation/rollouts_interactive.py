@@ -10,7 +10,7 @@ from pytorch_lightning import seed_everything
 import torch
 
 from spil.evaluation.utils import imshow_tensor
-from spil.models.hulc import Hulc
+from spil.spil.models.hulc_bk import Hulc
 from spil.utils.utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)

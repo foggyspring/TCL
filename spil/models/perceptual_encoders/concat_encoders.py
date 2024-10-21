@@ -68,7 +68,7 @@ class ConcatEncoders(nn.Module):
         b, s, c, h, w = rgb_static.shape
         rgb_static = rgb_static.reshape(-1, c, h, w)  # (batch_size * sequence_length, 3, 200, 200)
         # ------------ Vision Network ------------ #
-        encoded_imgs = self.rgb_static_encoder(rgb_static)  # (batch*seq_len, 64)
+        encoded_imgs = self.rgb_static_encoder(rgb_static)  # (batch*seq_len, 64)， vision_network encoder
         encoded_imgs = encoded_imgs.reshape(b, s, -1)  # (batch, seq, 64)
 
         if depth_static is not None:
@@ -105,7 +105,7 @@ class ConcatEncoders(nn.Module):
             perceptual_emb = torch.cat([encoded_imgs, state_obs_out], dim=-1)
         else:
             perceptual_emb = encoded_imgs
-
+        # perceptual_emb_seg = perceptual_emb
         return perceptual_emb
 
     def state_reconstruction_loss(self):

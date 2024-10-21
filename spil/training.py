@@ -2,17 +2,18 @@ import logging
 from pathlib import Path
 import sys
 from typing import List, Union
-
 # This is for using the locally installed repo clone when using slurm
 sys.path.insert(0, Path(__file__).absolute().parents[1].as_posix())
 import hydra
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.loggers import LightningLoggerBase
+# from pytorch_lightning.loggers import LightningLoggerBase
+from pytorch_lightning.loggers import Logger as LightningLoggerBase
 from pytorch_lightning.utilities import rank_zero_only
 
-import spil.models.hulc as models_m
+from spil.models.hulc import Hulc
+from spil.models.spil import Spil
 from spil.utils.utils import (
     get_git_commit_hash,
     get_last_checkpoint,
@@ -35,10 +36,9 @@ def train(cfg: DictConfig) -> None:
     seed_everything(cfg.seed, workers=True)  # type: ignore
     datamodule = hydra.utils.instantiate(cfg.datamodule)
     chk = get_last_checkpoint(Path.cwd())
-
     # Load Model
     if chk is not None:
-        model = getattr(models_m, cfg.model["_target_"].split(".")[-1]).load_from_checkpoint(chk.as_posix())
+        model = eval(cfg.model["_target_"].split(".")[-1]).load_from_checkpoint(chk.as_posix())
     else:
         model = hydra.utils.instantiate(cfg.model)
         if "pretrain_chk" in cfg:

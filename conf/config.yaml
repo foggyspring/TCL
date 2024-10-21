@@ -1,8 +1,8 @@
 defaults:
   - callbacks: default
   - datamodule: default
-  - model: spil
-  - loss: default
+  - model: spil # hulc for hulc, spil for spil
+  - loss: spil # hulc for hulc, default for spil
   - training: default_training
   - trainer: play_trainer
   - logger: wandb

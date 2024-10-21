@@ -1,0 +1,33 @@
+cmake==3.18.4
+wheel
+numpy
+hydra-core
+hydra-colorlog
+matplotlib
+opencv-python
+omegaconf
+plotly
+ftfy
+pyhash
+pytorch-lightning
+torch==2.1.0
+torchvision
+torchaudio
+# MulticoreTSNE~=0.1 #Ensure cmake version is < 3.2 #86
+gitpython
+scipy
+sentence-transformers
+# pytorch3d
+gym
+moviepy
+tqdm
+termcolor
+wandb
+
+regex
+Pillow
+pybullet
+trimesh
+urdfpy
+pyrender
+setuptools

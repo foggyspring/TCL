@@ -5,7 +5,7 @@ defaults:
   - observation_space: lang_rgb_static_gripper_rel_act
 _target_: spil.datasets.spil_data_module.SpilDataModule
 _recursive_: false
-root_data_dir: ???
+root_data_dir: /home/ubuntu/dataset/calvin/task_ABC_D #/home/ubuntu/dataset/calvin/task_D_D
 action_space: 7
 action_max: [1., 1., 1., 1., 1., 1., 1.,]
 action_min: [-1., -1., -1., -1., -1., -1., -1]

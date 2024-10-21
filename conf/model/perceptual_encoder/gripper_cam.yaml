@@ -1,4 +1,5 @@
 _target_: spil.models.perceptual_encoders.concat_encoders.ConcatEncoders
+
 _recursive_: false
 
 defaults:

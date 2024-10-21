@@ -13,6 +13,7 @@ from torch.nn.functional import binary_cross_entropy_with_logits, cross_entropy
 
 from spil.models.decoders.action_decoder import ActionDecoder
 from spil.utils.distributions import State
+import pdb
 
 logger = logging.getLogger(__name__)
 
@@ -70,14 +71,22 @@ class Spil(pl.LightningModule):
         bc_z_auxiliary_loss_beta: float,
         use_mia_auxiliary_loss: bool,
         mia_auxiliary_loss_beta: float,
+        temporal_contrastive_loss_beta: float,
+        lang_vis_temporal_contrastive_loss_beta: float,
+        use_temporal_contrastive_loss: bool,
+        use_action_chunk: bool,
+        use_lang_vis_temporal_contrastive_loss: bool,
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         distribution: DictConfig,
         val_instructions: DictConfig,
         use_clip_auxiliary_loss: bool,
         clip_auxiliary_loss_beta: float,
+        ce_beta: float =0.1,
         replan_freq: int = 30,
+        temperature: int = 1.0,
         language_encoder: Optional[DictConfig] = None,
+        language_encoder2: Optional[DictConfig] = None,
         bc_z_lang_decoder: Optional[DictConfig] = None,
         mia_lang_discriminator: Optional[DictConfig] = None,
         proj_vis_lang: Optional[DictConfig] = None,
@@ -103,17 +112,23 @@ class Spil(pl.LightningModule):
 
         # language encoder
         self.language_encoder = hydra.utils.instantiate(language_encoder) if language_encoder else None
+        
+        # lang_encoder2 for task_id prediction
+        self.language_encoder2 = hydra.utils.instantiate(language_encoder2) if language_encoder2 else None
 
         # policy network
         self.action_decoder: ActionDecoder = hydra.utils.instantiate(action_decoder)
 
         # auxiliary losses
+        self.use_action_chunk = use_action_chunk
         self.use_clip_auxiliary_loss = use_clip_auxiliary_loss
         self.clip_auxiliary_loss_beta = clip_auxiliary_loss_beta
         self.use_bc_z_auxiliary_loss = use_bc_z_auxiliary_loss
         self.bc_z_auxiliary_loss_beta = bc_z_auxiliary_loss_beta
         self.use_mia_auxiliary_loss = use_mia_auxiliary_loss
         self.mia_auxiliary_loss_beta = mia_auxiliary_loss_beta
+        self.temporal_contrastive_loss_beta = temporal_contrastive_loss_beta # 0.05
+        self.lang_vis_temporal_contrastive_loss_beta = lang_vis_temporal_contrastive_loss_beta # 0.1
         if use_clip_auxiliary_loss:
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             self.proj_vis_lang = hydra.utils.instantiate(proj_vis_lang)
@@ -125,7 +140,11 @@ class Spil(pl.LightningModule):
         self.state_recons = state_recons
         self.st_recon_beta = state_recon_beta
 
+        self.use_temporal_contrastive_loss = use_temporal_contrastive_loss # true
+        self.use_lang_vis_temporal_contrastive_loss = use_lang_vis_temporal_contrastive_loss # false, lang as group labels
+        
         self.kl_beta = kl_beta
+        self.ce_beta = ce_beta
         self.kl_balancing_mix = kl_balancing_mix
 
         self.modality_scope = "vis"
@@ -134,6 +153,9 @@ class Spil(pl.LightningModule):
         # action_decoder.out_features = action_decoder.out_features
         # self.perceptual_encoder.bc_z_lang_decoder.perceptual_features = self.perceptual_encoder.bc_z_lang_decoder.perceptual_features
         self.save_hyperparameters()
+
+        # temperature for multimodal constrastive loss
+        self.temperature = temperature # 1.0
 
         # for inference
         self.rollout_step_counter = 0
@@ -274,6 +296,7 @@ class Spil(pl.LightningModule):
             robot_obs: Unnormalized proprioceptive state (only used for world to tcp frame conversion in decoder).
         Returns:
             kl_loss: KL loss
+            TODO: ce_loss: cross entropy loss 
             action_loss: Behavior cloning action loss.
             total_loss: Sum of kl_loss and action_loss.
             pp_dist: Plan proposal distribution.
@@ -299,6 +322,56 @@ class Spil(pl.LightningModule):
         total_loss = action_loss + kl_loss
 
         return kl_loss, action_loss, total_loss, pp_dist, pr_dist, seq_feat
+
+    def lmp_seg_train(
+        self, perceptual_emb: torch.Tensor, perceptual_emb_seg: torch.Tensor, latent_goal: torch.Tensor, train_acts: torch.Tensor, robot_obs: torch.Tensor, lang_emb = None
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.distributions.Distribution,
+        torch.distributions.Distribution,
+        NamedTuple,
+        NamedTuple,
+    ]:
+        """
+        Main forward pass for training step after encoding raw inputs.
+
+        Args:
+            lang_emb: the embedding contains language instruction information.
+            perceptual_emb: Encoded input modalities.
+            perceptual_emb_seg: Encoded input modalities for segmented input.
+            latent_goal: Goal embedding (visual or language goal).
+            train_acts: Ground truth actions.
+            robot_obs: Unnormalized proprioceptive state (only used for world to tcp frame conversion in decoder).
+        Returns:
+            kl_loss: KL loss
+            action_loss: Behavior cloning action loss.
+            total_loss: Sum of kl_loss and action_loss.
+            pp_dist: Plan proposal distribution.
+            pr_dist: Plan recognition distribution
+            seq_feat: Features of plan recognition network before distribution.
+            seq_feat_seg: Features of plan recognition network before distribution for segmented input.
+        """
+        # ------------Plan Proposal------------ #
+        pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal)
+        pp_dist = self.dist.get_dist(pp_state)
+
+        # ------------Plan Recognition------------ #
+        pr_state, seq_feat, seq_feat_seg = self.plan_recognition(perceptual_emb, perceptual_emb_seg) # seq_feat, seq_feat_seg: (batch, 128)
+        pr_dist = self.dist.get_dist(pr_state)
+
+        sampled_plan = pr_dist.rsample()  # sample from recognition net, [] -> (batch, seq_num, 32, 32)
+        if self.dist.dist == "discrete":
+            sampled_plan = torch.flatten(sampled_plan, start_dim=-2, end_dim=-1) # (batch, seq_num, 32*32)
+
+        action_loss = self.action_decoder.loss(
+            sampled_plan, perceptual_emb, latent_goal, train_acts, robot_obs, lang_emb=lang_emb
+        )  # type:  ignore
+        kl_loss = torch.clip(self.compute_kl_loss(pp_state, pr_state), min=1e-8)
+        total_loss = action_loss + kl_loss
+
+        return kl_loss, action_loss, total_loss, pp_dist, pr_dist, seq_feat, seq_feat_seg
 
     def lmp_val(
         self, perceptual_emb: torch.Tensor, latent_goal: torch.Tensor, actions: torch.Tensor, robot_obs: torch.Tensor
@@ -358,7 +431,7 @@ class Spil(pl.LightningModule):
         gripper_sr_pp = torch.mean((gt_gripper_act != gripper_discrete_pp).float())
 
         # ------------Plan Recognition------------ #
-        pr_state, seq_feat = self.plan_recognition(perceptual_emb)
+        pr_state, seq_feat, _ = self.plan_recognition(perceptual_emb)
         pr_dist = self.dist.get_dist(pr_state)
         sampled_plan_pr = self.dist.sample_latent_plan(pr_dist)  # sample from recognition net
         action_loss_pr, sample_act_pr = self.action_decoder.loss_and_act(  # type:  ignore
@@ -387,6 +460,99 @@ class Spil(pl.LightningModule):
             gripper_sr_pp,
             gripper_sr_pr,
             seq_feat,
+        )
+        
+    
+    
+    def lmp_seg_val(
+        self, perceptual_emb: torch.Tensor, perceptual_emb_seg: torch.Tensor, latent_goal: torch.Tensor, actions: torch.Tensor, robot_obs: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        NamedTuple,
+        NamedTuple,
+    ]:
+        """
+        Main forward pass for validation step after encoding raw inputs.
+
+        Args:
+            perceptual_emb: Encoded input modalities.
+            latent_goal: Goal embedding (visual or language goal).
+            actions: Groundtruth actions.
+            robot_obs: Unnormalized proprioceptive state (only used for world to tcp frame conversion in decoder).
+
+        Returns:
+            sampled_plan_pp: Plan sampled from plan proposal network.
+            action_loss_pp: Behavior cloning action loss computed with plan proposal network.
+            sampled_plan_pr: Plan sampled from plan recognition network.
+            action_loss_pr: Behavior cloning action loss computed with plan recognition network.
+            kl_loss: KL loss
+            mae_pp: Mean absolute error (L1) of action sampled with input from plan proposal network w.r.t ground truth.
+            mae_pr: Mean absolute error of action sampled with input from plan recognition network w.r.t ground truth.
+            gripper_sr_pp: Success rate of binary gripper action sampled with input from plan proposal network.
+            gripper_sr_pr: Success rate of binary gripper action sampled with input from plan recognition network.
+            seq_feat: Features of plan recognition network before distribution.
+        """
+        # ------------Plan Proposal------------ #
+        pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal)  # (batch, 256) each
+        pp_dist = self.dist.get_dist(pp_state)
+
+        # ------------ Policy network ------------ #
+        sampled_plan_pp = self.dist.sample_latent_plan(pp_dist)  # sample from proposal net
+        action_loss_pp, sample_act_pp = self.action_decoder.loss_and_act(  # type:  ignore
+            sampled_plan_pp, perceptual_emb, latent_goal, actions, robot_obs
+        )
+
+        mae_pp = torch.nn.functional.l1_loss(
+            sample_act_pp[..., :-1], actions[..., :-1], reduction="none"
+        )  # (batch, seq, 6)
+        mae_pp = torch.mean(mae_pp, 1)  # (batch, 6)
+        # gripper action
+        gripper_discrete_pp = sample_act_pp[..., -1]
+        gt_gripper_act = actions[..., -1]
+        m = gripper_discrete_pp > 0
+        gripper_discrete_pp[m] = 1
+        gripper_discrete_pp[~m] = -1
+        gripper_sr_pp = torch.mean((gt_gripper_act != gripper_discrete_pp).float())
+
+        # ------------Plan Recognition------------ #
+        pr_state, seq_feat, seq_feat_seg = self.plan_recognition(perceptual_emb, perceptual_emb_seg)
+        pr_dist = self.dist.get_dist(pr_state)
+        sampled_plan_pr = self.dist.sample_latent_plan(pr_dist)  # sample from recognition net
+        action_loss_pr, sample_act_pr = self.action_decoder.loss_and_act(  # type:  ignore
+            sampled_plan_pr, perceptual_emb, latent_goal, actions, robot_obs
+        )
+        mae_pr = torch.nn.functional.l1_loss(
+            sample_act_pr[..., :-1], actions[..., :-1], reduction="none"
+        )  # (batch, seq, 6)
+        mae_pr = torch.mean(mae_pr, 1)  # (batch, 6)
+        kl_loss = torch.clip(self.compute_kl_loss(pp_state, pr_state), min=1e-8)
+        # gripper action
+        gripper_discrete_pr = sample_act_pr[..., -1]
+        m = gripper_discrete_pr > 0
+        gripper_discrete_pr[m] = 1
+        gripper_discrete_pr[~m] = -1
+        gripper_sr_pr = torch.mean((gt_gripper_act != gripper_discrete_pr).float())
+
+        return (
+            sampled_plan_pp,
+            action_loss_pp,
+            sampled_plan_pr,
+            action_loss_pr,
+            kl_loss,
+            mae_pp,
+            mae_pr,
+            gripper_sr_pp,
+            gripper_sr_pr,
+            seq_feat,
+            seq_feat_seg,
         )
 
     def training_step(self, batch: Dict[str, Dict], batch_idx: int) -> torch.Tensor:  # type: ignore
@@ -432,43 +598,147 @@ class Spil(pl.LightningModule):
         encoders_dict = {}
         batch_size: Dict[str, int] = {}
         total_bs = 0
+        # Add temporal contrastive loss for visual encoder. Meanwhile, the language latent goal can be a label to identify the task
+        # The demonstrations can be grouped together that have similar visual representation or the same language latent goal to represent the task.
+        # The temporal contrastive consist of the part, one is instance contrastive loss, the other is group contrastive loss. 
+        # Inspired by "Semi-Supervised Action Recognition with Temporal Contrastive Learning" by Ankit Singh et al.
+        
+        #set up for task_id
+       
+        # train_dataset_lang = self.trainer.datamodule.train_datasets["lang"]  # type: ignore
+        # lang_data_train_np = np.load(train_dataset_lang.abs_datasets_dir / train_dataset.lang_folder / "auto_lang_ann.npy", allow_pickle=True).item()
+        ####
+       
+            # train_dataset = self.trainer.datamodule.train_datasets["lang"]  # type: ignore
+            # lang_data_train = np.load(
+            #     train_dataset.abs_datasets_dir / train_dataset.lang_folder / "auto_lang_ann.npy", allow_pickle=True
+            # ).item() 
+            # train_lang_tasks = np.array(lang_data_train["language"]["task"])
+            # print("task:",train_lang_tasks)
+        
+        #file_path = "/home/ubuntu/dataset/calvin/task_D_D/training/lang_annotations/auto_lang_ann.npy"
+        #data = np.load(file_path, allow_pickle=True).item()
+        data = self.trainer.datamodule.train_datasets["lang"]
+        data = np.load(
+                data.abs_datasets_dir / data.lang_folder / "auto_lang_ann.npy", allow_pickle=True
+            ).item()
+        
+        
+        tasks = data['language']['task']
+        instructions = list(set(data['language']['ann']))
+        lang_ids = [data["language"]["ann"].index(instruction) for instruction in instructions]
+        
+        lang_tasks = list(np.array(data["language"]["task"])[lang_ids])
+        lang_task_ids = [list(set(lang_tasks)).index(task) for task in lang_tasks]
+        
+        task_to_id = {k: v for k, v in zip(set(lang_tasks), set(lang_task_ids))}
+        
+        # task_dict = {}
+        # for i, task in enumerate(tasks, start=0):
+        #     task_dict[i] = task
+        # unique_tasks = set(tasks)
+        # task_to_id = {task: index for index , task in enumerate(unique_tasks)}
+        # NOT_FOUND = object()
+        ###
         for self.modality_scope, dataset_batch in batch.items():
-            perceptual_emb = self.perceptual_encoder(
+            vis_latent_goal = None
+            # if "lang" not in self.modality_scope:
+            #     continue
+            perceptual_emb, perceptual_emb_seg = self.perceptual_encoder(
                 dataset_batch["rgb_obs"], dataset_batch["depth_obs"], dataset_batch["robot_obs"]
-            )
+            ) # perceptual_emb_seg (batch, seq_num+2, 64), if static depth or gripper cam is not None, then (batch, seq_num+2, 128), seq_num = self.seg_num (15)
             if self.state_recons:
                 proprio_loss += self.perceptual_encoder.state_reconstruction_loss()
             if "lang" in self.modality_scope:
-                latent_goal = self.language_goal(dataset_batch["lang"])
+                latent_goal = self.language_goal(dataset_batch["lang"]) # dim: (batch, 32)
                 if self.language_encoder is not None:
                     lang_emb = self.language_encoder(dataset_batch["lang"])
+                    #print("FIRST",lang_emb.shape)
                 else:
                     lang_emb = None
+                
+                if self.language_encoder2 is not None:
+                    #compute celoss?
+                    task_predic = self.language_encoder2(dataset_batch["lang"])
+                    idx = dataset_batch["idx"]  
+                   
+                    # gt_tasks = [task_to_id[data["language"]["task"][self.train_dataset.lang_lookup[i]]] for i in idx]
+                    # gt_tasks = np.array(gt_tasks)[dataset_batch["use_for_aux_lang_loss"].cpu().numpy()]
+                    # gt_tasks = torch.tensor(gt_tasks, device=idx.device)
+                    gt_tasks = torch.tensor([task_to_id[data["language"]["task"][self.train_dataset.lang_lookup[i]]] for i in idx], device=idx.device)
+                    #gt_tasks = gt_tasks[dataset_batch["use_for_aux_lang_loss"]]
+                    #pdb.set_trace()
+                    # gt_tasks = [task_dict.get(i.item(),NOT_FOUND) for i in idx]
+                    #valid_tasks = [v_task for v_task in gt_tasks if v_task is not NOT_FOUND]
+                    #if len(valid_tasks)== len(idx):
+                    #gt_task_indices = torch.tensor([task_to_id[task] for task in valid_tasks], device=idx.device)
+                    ce_loss = self.compute_ce_loss(task_predic,gt_tasks)
+                    
+                        
+                        
+                    lang_emb2 = task_predic
+                        #print("SECOND:",lang_emb2.shape)
+                    
+                    
+                else:
+                    lang_emb2 = None
+                    ce_loss = 0
+                
+                    
             else:
                 latent_goal = self.visual_goal(perceptual_emb[:, -1])
+                vis_latent_goal = latent_goal
                 lang_emb = None
-            kl, act_loss, mod_loss, pp_dist, pr_dist, seq_feat = self.lmp_train(
-                perceptual_emb, latent_goal, dataset_batch["actions"], dataset_batch["state_info"]["robot_obs"], lang_emb=lang_emb
+                lang_emb2 = None
+                ce_loss =0
+            
+            # training step
+            kl, act_loss, mod_loss, pp_dist, pr_dist, seq_feat, seq_feat_seg = self.lmp_seg_train(
+                perceptual_emb, perceptual_emb_seg, latent_goal, dataset_batch["actions"], dataset_batch["state_info"]["robot_obs"], lang_emb=lang_emb
             )
+                
             if "lang" in self.modality_scope:
                 if not torch.any(dataset_batch["use_for_aux_lang_loss"]):
                     batch_size["aux_lang"] = 1
+                    lang_info = None
+                    
                 else:
                     batch_size["aux_lang"] = torch.sum(dataset_batch["use_for_aux_lang_loss"]).detach()  # type:ignore
                     if self.use_bc_z_auxiliary_loss:
                         lang_pred_loss += self.bc_z_auxiliary_loss(
                             seq_feat, dataset_batch["lang"], dataset_batch["use_for_aux_lang_loss"]
                         )
+                    # true
                     if self.use_clip_auxiliary_loss:
                         lang_info = latent_goal
                         lang_clip_loss += self.clip_auxiliary_loss(
-                            seq_feat, lang_info, dataset_batch["use_for_aux_lang_loss"]
-                        )
+                                seq_feat, lang_info, dataset_batch["use_for_aux_lang_loss"]
+                            )
+                        # if use temporal contrastive loss, the vis-lang contrastive loss consists two part.
+                        if self.use_temporal_contrastive_loss:
+                            lang_clip_loss_seg = self.clip_auxiliary_loss(
+                                seq_feat_seg, lang_info, dataset_batch["use_for_aux_lang_loss"]
+                            )
+                            lang_clip_loss += (lang_clip_loss + lang_clip_loss_seg) / 2
+                            
                     if self.use_mia_auxiliary_loss:
                         lang_info = latent_goal
                         lang_contrastive_loss += self.mia_auxiliary_loss(
                             seq_feat, lang_info, dataset_batch["use_for_aux_lang_loss"]
                         )
+            
+            # if the modality_scope is "lang", use the language latent goal as the label to identify the task
+            # else use the last visual embedding as the label to identify the task
+            if self.use_temporal_contrastive_loss:
+                if "lang" in self.modality_scope and self.use_lang_vis_temporal_contrastive_loss and lang_info is not None and lang_emb2 is not None:
+                    #tc_loss = self.temporal_contrastive_loss_with_lang_grouping(seq_feat, seq_feat_seg, lang_info, dataset_batch["use_for_aux_lang_loss"])
+                    tc_loss = self.temporal_contrastive_loss_with_task_id(seq_feat, seq_feat_seg, lang_info, dataset_batch["use_for_aux_lang_loss"],lang_emb2)
+                elif vis_latent_goal is not None:
+                    tc_loss = self.temporal_contrastive_loss(seq_feat, seq_feat_seg, vis_latent_goal)
+                else:
+                    tc_loss = 0
+                
+            
             encoders_dict[self.modality_scope] = [pp_dist, pr_dist]
             kl_loss += kl
             action_loss += act_loss
@@ -539,10 +809,40 @@ class Spil(pl.LightningModule):
                 batch_size=batch_size["aux_lang"],
                 sync_dist=True,
             )
+        # temporal contrastive loss
+        if self.use_temporal_contrastive_loss:
+            total_loss = total_loss + self.temporal_contrastive_loss_beta * tc_loss 
+            total_loss = total_loss + ce_loss
+            self.log(
+                "train/temporal_contrastive_loss",
+                self.temporal_contrastive_loss_beta * tc_loss,
+                on_step=False,
+                on_epoch=True,
+                batch_size=total_bs,
+                sync_dist=True,
+            )
+        self.log("train/ce_loss",ce_loss, on_step=False, on_epoch=True, batch_size=total_bs)
         self.log("train/kl_loss", kl_loss, on_step=False, on_epoch=True, batch_size=total_bs)
         self.log("train/action_loss", action_loss, on_step=False, on_epoch=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True, batch_size=total_bs)
         return total_loss
+    
+    def compute_ce_loss(self,task_pre,task_gt) -> torch.Tensor:
+        """
+        compute cross entropy loss of task id classification of language_encoder2
+
+        Args:
+            predicted task id
+            task id ground truth
+
+        Returns:
+             scaled loss
+        """
+        criterion = nn.CrossEntropyLoss()
+        loss = criterion(task_pre,task_gt)
+        loss = self.ce_beta * loss
+        return loss
+    
 
     def compute_kl_loss(self, pp_state: State, pr_state: State) -> torch.Tensor:
         """
@@ -656,7 +956,7 @@ class Spil(pl.LightningModule):
                 return torch.tensor(0.0).to(self.device)
             seq_vis_feat = seq_vis_feat[use_for_aux_loss]
             encoded_lang = encoded_lang[use_for_aux_loss]
-        image_features, lang_features = self.proj_vis_lang(seq_vis_feat, encoded_lang)
+        image_features, lang_features = self.proj_vis_lang(seq_vis_feat, encoded_lang) # image_features: (batch, 32), lang_features: (batch, 32)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = lang_features / lang_features.norm(dim=-1, keepdim=True)
 
@@ -671,6 +971,163 @@ class Spil(pl.LightningModule):
         loss_t = cross_entropy(logits_per_text, labels)
         loss = (loss_i + loss_t) / 2
         return loss
+    
+    
+    
+    ## visual temporal contrastive loss， seq_feat: (batch, 128)
+    ## TODO: softmax seq_feat and seq_feat_seg before input?
+    ## L(f_i,s_i) = -log{h(f_i,s_i)/[h(f_i,s_i)+ sum(h(f_i,s_j))]} j=1,2,...,N, j!=i, 
+    ## h=exp(f^Ts/||f||*||s||*tau), ||f|| is the L2 norm of f
+    def temporal_contrastive_loss(self, seq_feat, seq_feat_seg, latent_goal = None):
+        assert self.use_temporal_contrastive_loss is not None
+        
+        ##### calculate the loss, v1 #####
+        # cat_seq_feat = torch.cat((seq_feat, seq_feat_seg), dim=0) # cat_seq_feat: (batch*2, 128)
+        
+        # ## calculate the similarity via exp(f^Ts/||f||2*||s||2*tau), f:seq_feat, s:seq_feat_seg, tau is the temperature
+        # sim_matrix = torch.mm(cat_seq_feat, cat_seq_feat.t())  # Compute similarity
+        # sim_mat_denom = torch.mm(torch.norm(cat_seq_feat, dim=1).unsqueeze(1), torch.norm(cat_seq_feat, dim=1).unsqueeze(1).t()) # (batch*2, batch*2)
+        # sim_matrix = sim_matrix / sim_mat_denom.clamp(min=1e-16)
+        # sim_matrix = torch.exp(sim_matrix / self.temperature)
+        
+        # ## calculate the match similarity
+        # sim_match_denom = torch.norm(seq_feat, dim=1) * torch.norm(seq_feat_seg, dim=1)
+        # sim_match = torch.exp(torch.sum(seq_feat * seq_feat_seg, dim=-1) / sim_match_denom / self.temperature)
+        # sim_match = torch.cat((sim_match, sim_match), dim=0)
+        # norm_sum = torch.exp(torch.ones(cat_seq_feat.shape[0]) / self.temperature)
+        # norm_sum = norm_sum.cuda()
+        # loss = torch.mean(-torch.log(sim_match / (torch.sum(sim_matrix, dim=-1) - norm_sum)))
+        
+        
+        ##### calculate the loss, v2 #####
+        # Concatenate features to form a batch for both sequences
+        cat_seq_feat = torch.cat((seq_feat, seq_feat_seg), dim=0)  # Shape: (batch * 2, features)
+
+        # Compute cosine similarity matrix
+        sim_matrix = torch.mm(cat_seq_feat, cat_seq_feat.t())  # Shape: (batch * 2, batch * 2)
+
+        # Scale similarity scores with temperature
+        sim_matrix /= self.temperature
+        # Mask to exclude self-similarities
+        mask = torch.eye(sim_matrix.size(0), dtype=torch.bool, device=sim_matrix.device)
+        sim_matrix.masked_fill_(mask, float('-inf'))
+
+        # Compute log-softmax of the similarity matrix along each row
+        log_prob = torch.nn.functional.log_softmax(sim_matrix, dim=1)
+
+        # Create labels for positive pairs (diagonal elements of each half of the matrix)
+        labels = torch.arange(cat_seq_feat.size(0), device=sim_matrix.device)
+        labels = torch.cat((labels[seq_feat.size(0):], labels[:seq_feat_seg.size(0)]))
+
+        # Compute the contrastive loss
+        loss = -torch.mean(log_prob[torch.arange(cat_seq_feat.size(0)), labels])
+        
+        return loss
+    
+    
+    def grouping_sample_with_intra_features(self, samples):
+        logits = torch.softmax(samples, dim=-1)
+        _ , indics = torch.topk(logits, 1, dim=-1)
+        groups = {}
+        for x, y in zip(indics, logits):
+            if x.item() not in groups:
+                groups[x.item()] = []
+            groups[x.item()].append(y)
+        
+        return groups
+    
+    # the latent goal can be a pseudo label to group the samples, latent_goal: vis/lang latent goal
+    # Need fix, can't use the maximum logit in the feature of each latent goal to group the samples
+    # the task number is 34, so the latent size should be aggregated to 34? Then use softmax to identify pseudo label for tasks
+    # while the current latent_goal feature size is 32, so need to extract the latent_goal feature to 34?
+    def grouping_sample_with_inter_features(self, samples, latent_goal):
+        logits = torch.softmax(latent_goal, dim=-1)
+        _ , indics = torch.topk(logits, 1, dim=-1)
+        groups = {}
+        for x, y in zip(indics, samples):
+            if x.item() not in groups:
+                groups[x.item()] = []
+            groups[x.item()].append(y)
+        
+        return groups
+        
+    
+    # group the samples with the same maximum latent goal feature, then calculate the contrastive loss
+    # group_seq_feat: {'0': [batch_idx, 32], '1': [batch_idx, 32], ...}
+    # group_seq_feat_seg: {'0': [batch_idx, 32], '1': [batch_idx, 32], ...}
+    def compute_group_contrastive_loss(self, group_seq_feat, group_seq_feat_seg):
+        loss = []
+        group_ori = []
+        group_seg = []
+        for key in group_seq_feat.keys():
+            if key in group_seq_feat_seg:
+                group_ori.append(torch.stack(group_seq_feat[key]).mean(dim=0)) # [batch, 32]
+                group_seg.append(torch.stack(group_seq_feat_seg[key]).mean(dim=0))
+        if len(group_seg) > 0:
+            group_ori = torch.stack(group_ori)
+            group_seg = torch.stack(group_seg)
+            loss = self.temporal_contrastive_loss(group_ori, group_seg)
+            loss = max(loss, torch.tensor(0.0).to(self.device))
+        else:
+            loss = torch.tensor(0.0).to(self.device)
+        return loss
+    
+    # visual + language temporal contrastive loss, the language latent goal as a label to identify the task
+    def temporal_contrastive_loss_with_lang_grouping(self, seq_feat, seq_feat_seg, encoded_lang, use_for_aux_loss):
+        assert self.use_temporal_contrastive_loss is not None
+        
+        if use_for_aux_loss is not None:
+            if not torch.any(use_for_aux_loss):
+                return torch.tensor(0.0).to(self.device)
+            seq_feat = seq_feat[use_for_aux_loss]
+            seq_feat_seg = seq_feat_seg[use_for_aux_loss]
+            encoded_lang = encoded_lang[use_for_aux_loss]
+            
+        # keep the feature size of img and lang the same, both the img and text feature size is 32
+        seq_feat, lang_features = self.proj_vis_lang(seq_feat, encoded_lang)
+        seq_feat_seg, _ = self.proj_vis_lang(seq_feat_seg, encoded_lang)
+        
+        # normalize the feature
+        seq_feat = seq_feat / seq_feat.norm(dim=-1, keepdim=True)
+        seq_feat_seg = seq_feat_seg / seq_feat_seg.norm(dim=-1, keepdim=True)
+        lang_features = lang_features / lang_features.norm(dim=-1, keepdim=True)
+            
+        group_seq_feat = self.grouping_sample_with_inter_features(seq_feat, lang_features)
+        group_seq_feat_seg = self.grouping_sample_with_inter_features(seq_feat_seg, lang_features)
+        
+        loss = self.compute_group_contrastive_loss(group_seq_feat, group_seq_feat_seg)
+    
+        return loss
+    
+    def temporal_contrastive_loss_with_task_id(self, seq_feat, seq_feat_seg, encoded_lang, use_for_aux_loss,task_logits):
+        assert self.use_temporal_contrastive_loss is not None
+        
+        if use_for_aux_loss is not None:
+            if not torch.any(use_for_aux_loss):
+                return torch.tensor(0.0).to(self.device)
+            seq_feat = seq_feat[use_for_aux_loss]
+            seq_feat_seg = seq_feat_seg[use_for_aux_loss]
+            encoded_lang = encoded_lang[use_for_aux_loss]
+            
+        # keep the feature size of img and lang the same, both the img and text feature size is 32
+        seq_feat,_ = self.proj_vis_lang(seq_feat, encoded_lang)
+        seq_feat_seg, _ = self.proj_vis_lang(seq_feat_seg, encoded_lang)
+        
+        
+        
+        # normalize the feature
+        seq_feat = seq_feat / seq_feat.norm(dim=-1, keepdim=True)
+        seq_feat_seg = seq_feat_seg / seq_feat_seg.norm(dim=-1, keepdim=True)
+        #lang_features = lang_features / lang_features.norm(dim=-1, keepdim=True)
+        #should logits normalized?
+            
+        group_seq_feat = self.grouping_sample_with_inter_features(seq_feat, task_logits)
+        group_seq_feat_seg = self.grouping_sample_with_inter_features(seq_feat_seg, task_logits)
+        
+        loss = self.compute_group_contrastive_loss(group_seq_feat, group_seq_feat_seg)
+    
+        return loss
+    
 
     def on_fit_start(self) -> None:
         """
@@ -680,6 +1137,8 @@ class Spil(pl.LightningModule):
         if self.use_clip_auxiliary_loss:
             train_dataset = self.trainer.datamodule.train_datasets["lang"]  # type: ignore
             val_dataset = self.trainer.datamodule.val_datasets["lang"]  # type: ignore
+            self.train_dataset = train_dataset
+            
             self.val_dataset = val_dataset
             lang_data_train = np.load(
                 train_dataset.abs_datasets_dir / train_dataset.lang_folder / "auto_lang_ann.npy", allow_pickle=True
@@ -713,6 +1172,7 @@ class Spil(pl.LightningModule):
                 val_lang_instructions.append(list(lang_embeddings_val[val_task]["ann"])[0])
             self.val_lang_emb = torch.cat(val_lang_emb).float()
             self.val_lang_task_ids = np.array([self.task_to_id[task] for task in val_lang_tasks])
+
 
     def validation_step(self, batch: Dict[str, Dict], batch_idx: int) -> Dict[str, torch.Tensor]:  # type: ignore
         """
@@ -749,7 +1209,8 @@ class Spil(pl.LightningModule):
         total_bs = 0.
         batch_size: Dict[str, int] = {}
         for self.modality_scope, dataset_batch in batch.items():
-            perceptual_emb = self.perceptual_encoder(
+            vis_latent_goal = None
+            perceptual_emb, perceptual_emb_seg = self.perceptual_encoder(
                 dataset_batch["rgb_obs"], dataset_batch["depth_obs"], dataset_batch["robot_obs"]
             )
             if self.state_recons:
@@ -759,7 +1220,24 @@ class Spil(pl.LightningModule):
                 latent_goal = self.language_goal(dataset_batch["lang"])
             else:
                 latent_goal = self.visual_goal(perceptual_emb[:, -1])
+                vis_latent_goal = latent_goal
 
+            ### original version code
+            # (
+            #     sampled_plan_pp,
+            #     action_loss_pp,
+            #     sampled_plan_pr,
+            #     action_loss_pr,
+            #     kl_loss,
+            #     mae_pp,
+            #     mae_pr,
+            #     gripper_sr_pp,
+            #     gripper_sr_pr,
+            #     seq_feat,
+            # ) = self.lmp_val(
+            #     perceptual_emb, latent_goal, dataset_batch["actions"], dataset_batch["state_info"]["robot_obs"]
+            # )
+            
             (
                 sampled_plan_pp,
                 action_loss_pp,
@@ -771,9 +1249,11 @@ class Spil(pl.LightningModule):
                 gripper_sr_pp,
                 gripper_sr_pr,
                 seq_feat,
-            ) = self.lmp_val(
-                perceptual_emb, latent_goal, dataset_batch["actions"], dataset_batch["state_info"]["robot_obs"]
+                seq_feat_seg,
+            ) = self.lmp_seg_val(
+                perceptual_emb, perceptual_emb_seg, latent_goal, dataset_batch["actions"], dataset_batch["state_info"]["robot_obs"]
             )
+            
             batch_size[self.modality_scope] = dataset_batch["actions"].shape[0]
             total_bs += dataset_batch["actions"].shape[0]
             if "lang" in self.modality_scope:
@@ -786,6 +1266,12 @@ class Spil(pl.LightningModule):
                     val_pred_clip_loss = self.clip_auxiliary_loss(
                         seq_feat, latent_goal, dataset_batch["use_for_aux_lang_loss"]
                     )
+                    # if use temporal_contrastive_loss, adding the clip loss for segmented features
+                    if self.use_temporal_contrastive_loss:
+                        val_pred_clip_loss_seg = self.clip_auxiliary_loss(
+                            seq_feat_seg, latent_goal, dataset_batch["use_for_aux_lang_loss"]
+                        )
+                        val_pred_clip_loss = (val_pred_clip_loss + val_pred_clip_loss_seg) / 2
                     self.log("val/val_pred_clip_loss", val_pred_clip_loss, sync_dist=True, batch_size=batch_size[self.modality_scope], on_epoch=True, on_step=False)
                     self.clip_groundtruth(seq_feat, dataset_batch["idx"], dataset_batch["use_for_aux_lang_loss"])
                 if self.use_mia_auxiliary_loss:
@@ -793,6 +1279,21 @@ class Spil(pl.LightningModule):
                         seq_feat, latent_goal, dataset_batch["use_for_aux_lang_loss"]
                     )
                     self.log("val/lang_contrastive_loss", val_pred_contrastive_loss, sync_dist=True, batch_size=batch_size[self.modality_scope], on_epoch=True, on_step=False)
+                    
+            # if the modality_scope is "lang", use the language latent goal as the label to identify the task
+            # else use the last visual embedding as the label to identify the task
+            if self.use_temporal_contrastive_loss:
+                if "lang" in self.modality_scope and self.use_lang_vis_temporal_contrastive_loss:
+                    lang_emb2_val = self.language_encoder2(dataset_batch["lang"])
+                    #val_tc_loss = self.temporal_contrastive_loss_with_lang_grouping(seq_feat, seq_feat_seg, latent_goal, dataset_batch["use_for_aux_lang_loss"])
+                    val_tc_loss = self.temporal_contrastive_loss_with_task_id(seq_feat, seq_feat_seg, latent_goal, dataset_batch["use_for_aux_lang_loss"],lang_emb2_val)
+                elif vis_latent_goal is not None:
+                    val_tc_loss = self.temporal_contrastive_loss(seq_feat, seq_feat_seg, vis_latent_goal)
+                else:
+                    val_tc_loss = 0.
+                self.log(f"val/{self.modality_scope}_temporal_contrastive_loss", val_tc_loss, batch_size=batch_size[self.modality_scope], on_epoch=True, on_step=False, sync_dist=True)
+            
+            
             val_total_act_loss_pp += action_loss_pp
             pr_mae_mean = mae_pr.mean()
             pp_mae_mean = mae_pp.mean()
@@ -832,6 +1333,7 @@ class Spil(pl.LightningModule):
         self.plan = None
         self.latent_goal = None
         self.rollout_step_counter = 0
+        self.action_decoder.clear_cached_actions()
 
     def step(self, obs, goal):
         """
@@ -872,10 +1374,42 @@ class Spil(pl.LightningModule):
         Returns:
             Predicted action.
         """
+        step = self.rollout_step_counter % self.replan_freq
         with torch.no_grad():
-            perceptual_emb = self.perceptual_encoder(obs["rgb_obs"], obs["depth_obs"], obs["robot_obs"])
-            action = self.action_decoder.act(
-                sampled_plan, perceptual_emb, latent_goal, obs["robot_obs_raw"]
+            perceptual_emb, _ = self.perceptual_encoder(obs["rgb_obs"], obs["depth_obs"], obs["robot_obs"])
+            if self.use_action_chunk:
+                action = self.action_decoder.act_chunk_with_queue(
+                    sampled_plan, perceptual_emb, latent_goal, obs["robot_obs_raw"], None, step
+                )
+            else:
+                action = self.action_decoder.act(
+                    sampled_plan, perceptual_emb, latent_goal, obs["robot_obs_raw"]
+                )  # type:  ignore
+
+        return action
+    
+    def predict_with_plan_and_temporal_action(
+        self,
+        obs: Dict[str, Any],
+        latent_goal: torch.Tensor,
+        sampled_plan: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Pass observation, goal and plan through decoder to get predicted action.
+
+        Args:
+            obs: Observation from environment.
+            latent_goal: Encoded goal.
+            sampled_plan: Sampled plan proposal plan.
+
+        Returns:
+            Predicted action.
+        """
+        step = self.rollout_step_counter % self.replan_freq
+        with torch.no_grad():
+            perceptual_emb, _ = self.perceptual_encoder(obs["rgb_obs"], obs["depth_obs"], obs["robot_obs"])
+            action = self.action_decoder.act_t(
+                sampled_plan, perceptual_emb, latent_goal, obs["robot_obs_raw"], step
             )  # type:  ignore
 
         return action
@@ -898,7 +1432,7 @@ class Spil(pl.LightningModule):
         depth_imgs = {k: torch.cat([v, goal["depth_obs"][k]], dim=1) for k, v in obs["depth_obs"].items()}
         state = torch.cat([obs["robot_obs"], goal["robot_obs"]], dim=1)
         with torch.no_grad():
-            perceptual_emb = self.perceptual_encoder(imgs, depth_imgs, state)
+            perceptual_emb, _ = self.perceptual_encoder(imgs, depth_imgs, state)
             latent_goal = self.visual_goal(perceptual_emb[:, -1])
             # ------------Plan Proposal------------ #
             pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal)
@@ -920,7 +1454,7 @@ class Spil(pl.LightningModule):
             latent_goal: Encoded language goal.
         """
         with torch.no_grad():
-            perceptual_emb = self.perceptual_encoder(obs["rgb_obs"], obs["depth_obs"], obs["robot_obs"])
+            perceptual_emb, _ = self.perceptual_encoder(obs["rgb_obs"], obs["depth_obs"], obs["robot_obs"])
             latent_goal = self.language_goal(goal["lang"])
             # ------------Plan Proposal------------ #
             pp_state = self.plan_proposal(perceptual_emb[:, 0], latent_goal)
@@ -961,7 +1495,7 @@ class Spil(pl.LightningModule):
         """
         if use_for_aux_loss is not None and not torch.any(use_for_aux_loss):
             return
-        seq_feat_vis = seq_feat_vis[use_for_aux_loss]
+        seq_feat_vis = seq_feat_vis[use_for_aux_loss] 
         gt_tasks = [
             self.task_to_id[self.lang_data_val["language"]["task"][self.val_dataset.lang_lookup[i]]] for i in idx
         ]

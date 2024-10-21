@@ -13,6 +13,16 @@ class ActionDecoder(nn.Module):
             robot_obs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
+    
+    def act_t(
+            self,
+            latent_plan: torch.Tensor,
+            perceptual_emb: torch.Tensor,
+            latent_goal: torch.Tensor,
+            robot_obs: Optional[torch.Tensor] = None,
+            rollout_step: Optional[int] = 0,
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
     def loss(
             self,
